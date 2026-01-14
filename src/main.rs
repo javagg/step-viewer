@@ -26,6 +26,13 @@ enum AxesMode {
     ScreenTriad,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionMode {
+    Point,
+    Edge,
+    Face,
+}
+
 #[derive(Resource)]
 struct ViewerState {
     pending_path: Option<std::path::PathBuf>,
@@ -61,6 +68,8 @@ struct ViewerState {
     scene_center: Vec3,
     /// Scene normalization: scale factor (for wireframe rendering)
     scene_scale: f32,
+    /// Selection mode (point/edge/face)
+    selection_mode: SelectionMode,
 }
 
 impl Default for ViewerState {
@@ -93,6 +102,7 @@ impl Default for ViewerState {
             visibility_changed: false,
             scene_center: Vec3::ZERO,
             scene_scale: 1.0,
+            selection_mode: SelectionMode::Face,
         }
     }
 }
@@ -105,6 +115,7 @@ struct FaceRecord {
     visible: bool,
     ui_color: [f32; 3],
     mesh_handle: Handle<Mesh>,
+    material_handle: Handle<StandardMaterial>,
 }
 
 struct ShellRecord {
@@ -112,6 +123,13 @@ struct ShellRecord {
     name: String,
     expanded: bool,
     face_ids: Vec<usize>, // indices into ViewerState.faces
+}
+
+#[derive(Resource, Default)]
+struct SelectionState {
+    selected_faces: std::collections::HashSet<usize>,
+    selected_edges: Vec<(Vec3, Vec3)>,
+    selected_points: Vec<Vec3>,
 }
 
 #[derive(Component)]
@@ -198,6 +216,7 @@ fn main() {
             pending_path: cli_path.clone(),
             ..Default::default()
         })
+        .insert_resource(SelectionState::default())
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
@@ -228,6 +247,8 @@ fn main() {
         .add_systems(Update, apply_face_visibility)
         .add_systems(Update, disable_camera_when_egui_wants_input)
         .add_systems(Update, draw_gizmos)
+        .add_systems(Update, draw_selection_gizmos)
+        .add_systems(Update, handle_picking_clicks)
         .run();
 }
 
@@ -477,6 +498,7 @@ fn spawn_shell_faces_normalized(
             metallic: 0.0,
             ..Default::default()
         });
+        let material_handle = material.clone();
 
         commands.spawn((
             FaceMesh {
@@ -496,6 +518,7 @@ fn spawn_shell_faces_normalized(
             visible: true,
             ui_color: ui_rgb,
             mesh_handle,
+            material_handle,
         });
 
         face_ids.push(global_face_id);
@@ -897,7 +920,7 @@ fn ui_system(
                         axes_btn.on_hover_text("Show axes indicator");
 
                         // Axes mode combo (World vs Screen)
-                        egui::ComboBox::from_id_source("axes_mode_combo")
+                        egui::ComboBox::from_id_salt("axes_mode_combo")
                             .selected_text(match state.axes_mode { AxesMode::World => "World", AxesMode::ScreenTriad => "Screen" })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut state.axes_mode, AxesMode::World, "World");
@@ -914,11 +937,32 @@ fn ui_system(
                         }
                         grids_btn.on_hover_text("Show XY/YZ/XZ grids");
 
-                        // Grid planes selection (XY/YZ/XZ)
-                        ui.label("Grid:");
-                        ui.toggle_value(&mut state.show_grid_xy, "XY");
-                        ui.toggle_value(&mut state.show_grid_yz, "YZ");
-                        ui.toggle_value(&mut state.show_grid_xz, "XZ");
+                        // Grid planes selection via dropdown with checkboxes
+                        let mut planes: Vec<&str> = Vec::new();
+                        if state.show_grid_xy { planes.push("XY"); }
+                        if state.show_grid_yz { planes.push("YZ"); }
+                        if state.show_grid_xz { planes.push("XZ"); }
+                        let selected_text = if planes.is_empty() { "None".to_string() } else { planes.join("/") };
+                        egui::ComboBox::from_id_salt("grid_planes_combo")
+                            .selected_text(format!("Plane: {}", selected_text))
+                            .show_ui(ui, |ui| {
+                                let _ = ui.checkbox(&mut state.show_grid_xy, "XY");
+                                let _ = ui.checkbox(&mut state.show_grid_yz, "YZ");
+                                let _ = ui.checkbox(&mut state.show_grid_xz, "XZ");
+                            });
+
+                        ui.separator();
+
+                        // Selection mode
+                        ui.label("Select:");
+                        egui::ComboBox::from_id_salt("selection_mode_combo")
+                            .selected_text(match state.selection_mode { SelectionMode::Point => "Point", SelectionMode::Edge => "Edge", SelectionMode::Face => "Face" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut state.selection_mode, SelectionMode::Point, "Point");
+                                ui.selectable_value(&mut state.selection_mode, SelectionMode::Edge, "Edge");
+                                ui.selectable_value(&mut state.selection_mode, SelectionMode::Face, "Face");
+                            });
+                        ui.label("Ctrl Multi/Cancel");
 
                         // Scale ruler toggle (ruler icon: 📏)
                         let ruler_btn = ui.selectable_label(
@@ -1475,6 +1519,252 @@ fn draw_gizmos(state: Res<ViewerState>, mut gizmos: Gizmos) {
             color,
         );
     }
+
+    // Selection gizmos are drawn in draw_selection_gizmos()
+}
+
+/// Draw selection overlays for points and edges
+fn draw_selection_gizmos(
+    state: Res<ViewerState>,
+    sel: Res<SelectionState>,
+    mut gizmos: Gizmos,
+) {
+    let (_, spacing) = compute_grid_params(&state);
+    let cross = spacing * 0.15_f32;
+    let pcolor = Color::srgb(1.0, 0.9, 0.2);
+    let ecolor = Color::srgb(1.0, 0.6, 0.1);
+
+    // Points: draw small cross
+    for &p in &sel.selected_points {
+        gizmos.line(p + Vec3::new(-cross, 0.0, 0.0), p + Vec3::new(cross, 0.0, 0.0), pcolor);
+        gizmos.line(p + Vec3::new(0.0, -cross, 0.0), p + Vec3::new(0.0, cross, 0.0), pcolor);
+        gizmos.line(p + Vec3::new(0.0, 0.0, -cross), p + Vec3::new(0.0, 0.0, cross), pcolor);
+    }
+
+    // Edges: re-draw with highlight color
+    for &(a, b) in &sel.selected_edges {
+        gizmos.line(a, b, ecolor);
+    }
+}
+
+/// Handle mouse picking for points, edges, and faces with single/multi-select
+fn handle_picking_clicks(
+    mut contexts: EguiContexts,
+    mut state: ResMut<ViewerState>,
+    mut sel: ResMut<SelectionState>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    windows: Query<&Window>,
+    cam_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+    meshes: Res<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    // Only when clicking in the 3D viewport, not over egui
+    let Ok(ctx) = contexts.ctx_mut() else { return; };
+    if ctx.is_pointer_over_area() || ctx.wants_pointer_input() {
+        return;
+    }
+
+    if !buttons.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    let Ok(window) = windows.single() else { return; };
+    let Some(cursor) = window.cursor_position() else { return; };
+    let Ok((camera, cam_gt)) = cam_q.single() else { return; };
+
+    let Ok(ray) = camera.viewport_to_world(cam_gt, cursor) else { return; };
+
+    let multi = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+    if !multi {
+        // Clear previous selection and remove face highlights
+        for &fid in sel.selected_faces.iter() {
+            if let Some(face) = state.faces.iter().find(|f| f.id == fid) {
+                if let Some(mat) = materials.get_mut(&face.material_handle) {
+                    mat.emissive = Color::BLACK.into();
+                }
+            }
+        }
+        sel.selected_faces.clear();
+        sel.selected_edges.clear();
+        sel.selected_points.clear();
+    }
+
+    match state.selection_mode {
+        SelectionMode::Face => {
+            if let Some((fid, _t)) = pick_face(&state, &meshes, &ray) {
+                if multi && sel.selected_faces.contains(&fid) {
+                    sel.selected_faces.remove(&fid);
+                    if let Some(face) = state.faces.iter().find(|f| f.id == fid) {
+                        if let Some(mat) = materials.get_mut(&face.material_handle) {
+                            mat.emissive = Color::BLACK.into();
+                        }
+                    }
+                } else {
+                    sel.selected_faces.insert(fid);
+                    if let Some(face) = state.faces.iter().find(|f| f.id == fid) {
+                        if let Some(mat) = materials.get_mut(&face.material_handle) {
+                            mat.emissive = Color::srgb(1.0, 0.9, 0.2).into();
+                        }
+                    }
+                }
+            }
+        }
+        SelectionMode::Edge => {
+            if let Some((a, b)) = pick_edge(&state, &ray) {
+                if multi {
+                    // Toggle if already selected
+                    if let Some(idx) = sel
+                        .selected_edges
+                        .iter()
+                        .position(|&(pa, pb)| (pa - a).length() < 1e-6 && (pb - b).length() < 1e-6)
+                    {
+                        sel.selected_edges.remove(idx);
+                    } else {
+                        sel.selected_edges.push((a, b));
+                    }
+                } else {
+                    sel.selected_edges.push((a, b));
+                }
+            }
+        }
+        SelectionMode::Point => {
+            if let Some(p) = pick_point(&state, &meshes, &ray) {
+                if multi {
+                    if let Some(idx) = sel
+                        .selected_points
+                        .iter()
+                        .position(|&pp| (pp - p).length() < 1e-6)
+                    {
+                        sel.selected_points.remove(idx);
+                    } else {
+                        sel.selected_points.push(p);
+                    }
+                } else {
+                    sel.selected_points.push(p);
+                }
+            }
+        }
+    }
+}
+
+fn pick_face(
+    state: &ViewerState,
+    meshes: &Assets<Mesh>,
+    ray: &bevy::prelude::Ray3d,
+) -> Option<(usize, f32)> {
+    let mut best: Option<(usize, f32)> = None;
+    for face in &state.faces {
+        if !face.visible {
+            continue;
+        }
+        let Some(mesh) = meshes.get(&face.mesh_handle) else { continue; };
+        let Some(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION).and_then(|a| a.as_float3()) else { continue; };
+        // Triangle list; step by 3
+        for tri in positions.chunks_exact(3) {
+            let v0 = Vec3::from_array(tri[0]);
+            let v1 = Vec3::from_array(tri[1]);
+            let v2 = Vec3::from_array(tri[2]);
+            if let Some(t) = ray_triangle(ray.origin, ray.direction.into(), v0, v1, v2) {
+                match best {
+                    Some((_, bt)) if t >= bt => {}
+                    _ => best = Some((face.id, t)),
+                }
+            }
+        }
+    }
+    best
+}
+
+fn pick_edge(state: &ViewerState, ray: &bevy::prelude::Ray3d) -> Option<(Vec3, Vec3)> {
+    let Some(scene) = &state.scene_data else { return None; };
+    let mut best: Option<(Vec3, Vec3, f32)> = None;
+    let (_, spacing) = compute_grid_params(state);
+    let thresh = spacing * 0.25;
+    let center = state.scene_center;
+    let scale = state.scene_scale;
+
+    for shell in &scene.shells {
+        for &(p0_arr, p1_arr) in &shell.edges {
+            let p0r = Vec3::new(p0_arr[0] as f32, p0_arr[1] as f32, p0_arr[2] as f32);
+            let p1r = Vec3::new(p1_arr[0] as f32, p1_arr[1] as f32, p1_arr[2] as f32);
+            let p0 = (p0r - center) * scale;
+            let p1 = (p1r - center) * scale;
+            let dist = ray_segment_distance(ray.origin, ray.direction.into(), p0, p1);
+            if dist <= thresh {
+                let t = dist; // use distance as tie-breaker
+                match best {
+                    Some((_, _, bd)) if t >= bd => {}
+                    _ => best = Some((p0, p1, t)),
+                }
+            }
+        }
+    }
+    best.map(|(a, b, _)| (a, b))
+}
+
+fn pick_point(state: &ViewerState, meshes: &Assets<Mesh>, ray: &bevy::prelude::Ray3d) -> Option<Vec3> {
+    let mut best: Option<(Vec3, f32)> = None;
+    let (_, spacing) = compute_grid_params(state);
+    let thresh = spacing * 0.15;
+    for face in &state.faces {
+        if !face.visible { continue; }
+        let Some(mesh) = meshes.get(&face.mesh_handle) else { continue; };
+        let Some(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION).and_then(|a| a.as_float3()) else { continue; };
+        for &p in positions.iter() {
+            let v = Vec3::from_array(p);
+            let dist = point_ray_distance(v, ray.origin, ray.direction.into());
+            if dist <= thresh {
+                match best {
+                    Some((_, bd)) if dist >= bd => {}
+                    _ => best = Some((v, dist)),
+                }
+            }
+        }
+    }
+    best.map(|(v, _)| v)
+}
+
+fn ray_triangle(origin: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<f32> {
+    let eps = 1e-6;
+    let e1 = v1 - v0;
+    let e2 = v2 - v0;
+    let pvec = dir.cross(e2);
+    let det = e1.dot(pvec);
+    if det.abs() < eps { return None; }
+    let inv_det = 1.0 / det;
+    let tvec = origin - v0;
+    let u = tvec.dot(pvec) * inv_det;
+    if u < 0.0 || u > 1.0 { return None; }
+    let qvec = tvec.cross(e1);
+    let v = dir.dot(qvec) * inv_det;
+    if v < 0.0 || u + v > 1.0 { return None; }
+    let t = e2.dot(qvec) * inv_det;
+    if t > 0.0 { Some(t) } else { None }
+}
+
+fn ray_segment_distance(origin: Vec3, dir: Vec3, p0: Vec3, p1: Vec3) -> f32 {
+    let l = p1 - p0;
+    let a = dir.dot(dir);
+    let b = dir.dot(l);
+    let c = l.dot(l);
+    let w0 = origin - p0;
+    let d = dir.dot(w0);
+    let e = l.dot(w0);
+    let denom = a * c - b * b;
+    let mut s = if denom.abs() > 1e-6 { (a * e - b * d) / denom } else { 0.0 };
+    s = s.clamp(0.0, 1.0);
+    let t = (b * s + d) / a;
+    let t = t.max(0.0);
+    let closest_ray = origin + dir * t;
+    let closest_seg = p0 + l * s;
+    (closest_ray - closest_seg).length()
+}
+
+fn point_ray_distance(p: Vec3, origin: Vec3, dir: Vec3) -> f32 {
+    let t = (p - origin).dot(dir);
+    let closest = if t < 0.0 { origin } else { origin + dir * t };
+    (p - closest).length()
 }
 
 /// Compute adaptive grid extent and spacing from current bounds.
